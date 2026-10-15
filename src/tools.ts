@@ -205,7 +205,7 @@ export function buildServer(cfg: Config): McpServer {
         'restore',
         {
             title: 'Restore deleted record',
-            description: 'Restore a soft-deleted record (hardware, users, licenses, models, and other resources that support it).',
+            description: 'Restore a soft-deleted record. Snipe-IT supports this for hardware, users, models and manufacturers.',
             inputSchema: z.object({ resource: z.enum(WRITABLE), id }),
             annotations: { ...rw, idempotentHint: true }
         },
@@ -286,19 +286,21 @@ export function buildServer(cfg: Config): McpServer {
                     return trim(await api.post(`hardware/${id}/checkin`, { note, status_id, location_id }));
                 case 'accessories': {
                     if (!from_user_id) throw new Error('accessories checkin needs from_user_id');
+                    // rows: { id: <checkout record id>, assigned_to: {id, ...} }
                     const rows = (await api.get(`accessories/${id}/checkedout`, { limit: 500 })).rows ?? [];
-                    const row = rows.find((r: any) => (r.assigned_to?.id ?? r.id) === from_user_id);
+                    const row = rows.find((r: any) => r.assigned_to?.id === from_user_id);
                     if (!row) throw new Error(`Accessory ${id} is not checked out to user ${from_user_id}`);
-                    return trim(await api.post(`accessories/${row.assigned_pivot_id ?? row.pivot_id ?? row.id}/checkin`, { note }));
+                    return trim(await api.post(`accessories/${row.id}/checkin`, { note }));
                 }
                 case 'components': {
                     if (!from_asset_id) throw new Error('components checkin needs from_asset_id');
                     const rows = (await api.get(`components/${id}/assets`, { limit: 500 })).rows ?? [];
-                    const row = rows.find((r: any) => (r.asset?.id ?? r.id) === from_asset_id);
+                    // rows: { assigned_pivot_id, name: <compact asset>, assigned_qty }
+                    const row = rows.find((r: any) => (r.name?.id ?? r.id) === from_asset_id);
                     if (!row) throw new Error(`Component ${id} is not checked out to asset ${from_asset_id}`);
                     return trim(
-                        await api.post(`components/${row.assigned_pivot_id ?? row.pivot_id ?? row.id}/checkin`, {
-                            checkin_qty: quantity ?? row.assigned_qty ?? row.qty ?? 1,
+                        await api.post(`components/${row.assigned_pivot_id}/checkin`, {
+                            checkin_qty: quantity ?? row.assigned_qty ?? 1,
                             note
                         })
                     );
@@ -332,7 +334,9 @@ export function buildServer(cfg: Config): McpServer {
             }),
             annotations: rw
         },
-        run(async ({ id, ...body }) => trim(await api.post(`hardware/${id}/audit`, body)))
+        run(async ({ id, update_location, ...body }) =>
+            trim(await api.post(`hardware/${id}/audit`, { ...body, update_location: update_location ? 1 : 0 }))
+        )
     );
 
     return server;

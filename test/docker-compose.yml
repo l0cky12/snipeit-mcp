@@ -23,6 +23,8 @@ services:
       MAIL_FROM_NAME: Snipe-IT
   db:
     image: mariadb:11
+    # Native AIO hangs under Docker on loop-device / LXC hosts; fsync is fine for a test instance.
+    command: ["--innodb-use-native-aio=0", "--innodb-flush-method=fsync", "--innodb-flush-log-at-trx-commit=0", "--skip-innodb-doublewrite"]
     environment:
       MYSQL_DATABASE: snipeit
       MYSQL_USER: snipeit
@@ -32,4 +34,4 @@ services:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 5s
       timeout: 2s
-      retries: 30
+      retries: 60
