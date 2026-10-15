@@ -2,7 +2,7 @@
 services:
   app:
     image: snipe/snipe-it:latest
-    ports: ["8765:80"]
+    ports: ["127.0.0.1:8765:80"]
     depends_on:
       db: { condition: service_healthy }
     environment:
