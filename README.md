@@ -16,6 +16,10 @@ It asks for your Snipe-IT URL and token, validates them against the live instanc
 
 Environment variables override the file: `SNIPEIT_URL`, `SNIPEIT_API_TOKEN`, and `SNIPEIT_READ_ONLY=1` (hides every write tool).
 
+`SNIPEIT_READ_ONLY` accepts `1`, `true`, or `yes` to enable read-only mode, and `0`, `false`, or `no` to disable it (case-insensitive). Invalid values or malformed config files stop startup. Running setup again preserves the saved read-only setting and replaces the credentials file with owner-only permissions.
+
+Use the final HTTP(S) instance URL without embedded credentials, query parameters, or a fragment. Requests time out after 30 seconds and reject redirects and non-JSON success responses. Writes are not automatically retried; if a request times out, check the record before retrying because Snipe-IT may have completed the write.
+
 ### Claude Code
 
 ```bash
@@ -58,6 +62,8 @@ Resources: `hardware`, `users`, `licenses`, `accessories`, `consumables`, `compo
 
 Responses are trimmed by default: nested date objects collapse to strings, nulls and `available_actions` are dropped, custom fields become `{name: value}`. Pass `raw: true` to `list`/`get` for the untouched payload.
 
+Pass `search`, `sort`, `order`, `limit`, and `offset` as top-level `list` arguments, not inside `filters`. Internal custom-field and assignment lookups follow pagination. Checkout rejects unsupported target types; license checkin requires exactly one of `from_user_id` or `from_asset_id`.
+
 ## Development
 
 ```bash
@@ -67,6 +73,8 @@ bash test/snipeit-up.sh         # throwaway Snipe-IT in Docker with demo data (p
 npm run test:integration        # end-to-end against it
 docker compose -f test/docker-compose.yml down -v
 ```
+
+The demo instance binds to `127.0.0.1` only. Its generated admin token stays in the ignored, owner-readable `test/.snipeit-token` file. The root `snipeit-up.sh` forwards to the same test harness.
 
 ## License
 

@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
@@ -15,27 +15,46 @@ export function configPath(): string {
     return join(base, 'snipeit-mcp', 'config.json');
 }
 
+function readConfig(): Partial<Config> {
+    let contents: string;
+    try {
+        contents = readFileSync(configPath(), 'utf8');
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {};
+        throw new Error(`Cannot read config at ${configPath()}`);
+    }
+    try {
+        const file = JSON.parse(contents);
+        if (!file || typeof file !== 'object' || Array.isArray(file) ||
+            (file.url !== undefined && typeof file.url !== 'string') ||
+            (file.token !== undefined && typeof file.token !== 'string') ||
+            (file.readOnly !== undefined && typeof file.readOnly !== 'boolean')) throw new Error();
+        return file;
+    } catch {
+        throw new Error(`Invalid config at ${configPath()}: expected URL/token strings and a readOnly boolean`);
+    }
+}
+
 /** Env vars win; the file written by `snipeit-mcp setup` is the fallback. */
 export function loadConfig(): Config {
-    let file: Partial<Config> = {};
-    try {
-        file = JSON.parse(readFileSync(configPath(), 'utf8'));
-    } catch {
-        /* no file yet */
-    }
-    const url = process.env.SNIPEIT_URL || file.url;
-    const token = process.env.SNIPEIT_API_TOKEN || file.token;
+    const file = readConfig();
+    const url = (process.env.SNIPEIT_URL || file.url)?.trim();
+    const token = (process.env.SNIPEIT_API_TOKEN || file.token)?.trim();
     if (!url || !token) {
         throw new Error(
             `Snipe-IT URL/token not configured. Run \`snipeit-mcp setup\` or set SNIPEIT_URL and SNIPEIT_API_TOKEN.`
         );
     }
-    const ro = process.env.SNIPEIT_READ_ONLY;
+    const ro = process.env.SNIPEIT_READ_ONLY?.trim();
+    if (ro !== undefined && !/^(1|true|yes|0|false|no)$/i.test(ro)) {
+        throw new Error('SNIPEIT_READ_ONLY must be 1/true/yes or 0/false/no');
+    }
     const readOnly = ro !== undefined ? /^(1|true|yes)$/i.test(ro) : Boolean(file.readOnly);
     return { url: url.replace(/\/+$/, ''), token, readOnly };
 }
 
 export async function setup(): Promise<void> {
+    const previous = readConfig();
     const rl = createInterface({ input: process.stdin, output: process.stdout });
     try {
         const url = (await rl.question('Snipe-IT URL (e.g. https://snipeit.example.com): ')).trim().replace(/\/+$/, '');
@@ -51,7 +70,15 @@ export async function setup(): Promise<void> {
         }
         const path = configPath();
         mkdirSync(join(path, '..'), { recursive: true, mode: 0o700 });
-        writeFileSync(path, JSON.stringify({ url, token }, null, 2) + '\n', { mode: 0o600 });
+        // Replace atomically: mode on writeFileSync alone does not secure an existing file.
+        const temp = mkdtempSync(join(path, '..', '.config-'));
+        try {
+            const config = { url, token, ...(previous.readOnly === undefined ? {} : { readOnly: previous.readOnly }) };
+            writeFileSync(join(temp, 'config.json'), JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+            renameSync(join(temp, 'config.json'), path);
+        } finally {
+            rmSync(temp, { recursive: true, force: true });
+        }
         console.log(`Saved to ${path} (owner-only permissions).\n`);
         console.log('Add to Claude Code:\n  claude mcp add -s user snipeit -- npx -y snipeit-mcp\n');
         console.log('Add to OpenClaw:\n  openclaw mcp add snipeit --command npx --arg -y --arg snipeit-mcp');
