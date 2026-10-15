@@ -41,7 +41,7 @@ const FIELDS: Record<Resource, string> = {
     maintenances:
         'create/update: asset_id*, title*, asset_maintenance_type* (Maintenance|Repair|Upgrade|PAT test|Calibration|Software Support|Hardware Support|Configuration Change), supplier_id*, start_date*, completion_date, cost, is_warranty, notes.\nlist filters: asset_id.',
     activity:
-        'read-only audit log. list filters: item_type (asset|accessory|consumable|component|license|user), item_id, action_type (checkout|"checkin from"|update|create|delete|audit|uploaded|accepted|declined|requested), target_type (user|asset|location), target_id.'
+        'read-only audit log. list filters: item_type (asset|accessory|consumable|component|license|user), item_id, action_type ("create new"|update|checkout|"checkin from"|audit|delete|restore|uploaded|accepted|declined|requested), target_type (user|asset|location), target_id.'
 };
 
 const text = (s: string) => ({ content: [{ type: 'text' as const, text: s }] });
@@ -253,8 +253,9 @@ export function buildServer(cfg: Config): McpServer {
                     return trim(await api.post(`components/${id}/checkout`, { assigned_to: target_id, assigned_qty: quantity ?? 1, note }));
                 case 'licenses': {
                     const seats = (await api.get(`licenses/${id}/seats`, { limit: 500 })).rows ?? [];
-                    const free = seats.find((s: any) => !s.assigned_user && !s.assigned_asset);
-                    if (!free) throw new Error(`License ${id} has no free seats`);
+                    // disabled = seat already used on a non-reassignable license, or the license is inactive
+                    const free = seats.find((s: any) => !s.assigned_user && !s.assigned_asset && !s.disabled);
+                    if (!free) throw new Error(`License ${id} has no free seats available for checkout`);
                     const body = to === 'asset' ? { asset_id: target_id, note } : { assigned_to: target_id, note };
                     return trim(await api.put(`licenses/${id}/seats/${free.id}`, body));
                 }

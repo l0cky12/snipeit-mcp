@@ -4,9 +4,9 @@ import { readFileSync } from 'node:fs';
 import { after, before, test } from 'node:test';
 import { startServer } from './rpc.mjs';
 
-const URL = process.env.SNIPEIT_URL || 'http://localhost:8765';
+const BASE = process.env.SNIPEIT_URL || 'http://localhost:8765';
 const TOKEN = process.env.SNIPEIT_API_TOKEN || readFileSync(new URL('./.snipeit-token', import.meta.url), 'utf8').trim();
-const s = startServer({ SNIPEIT_URL: URL, SNIPEIT_API_TOKEN: TOKEN, XDG_CONFIG_HOME: '/nonexistent' });
+const s = startServer({ SNIPEIT_URL: BASE, SNIPEIT_API_TOKEN: TOKEN, XDG_CONFIG_HOME: '/nonexistent' });
 const tag = `MCP-TEST-${Date.now()}`;
 let user, model, status, asset;
 
@@ -49,7 +49,7 @@ test('hardware lifecycle: create, lookup, update, checkout, list by user, checki
 
     const log = await s.call('list', { resource: 'activity', filters: { item_type: 'asset', item_id: asset.id }, limit: 50 });
     const actions = log.rows.map(r => r.action_type);
-    for (const a of ['create', 'checkout', 'checkin from', 'audit', 'delete', 'restore']) assert.ok(actions.includes(a), `activity has ${a}: ${actions}`);
+    for (const a of ['create new', 'update', 'checkout', 'checkin from', 'audit', 'delete', 'restore']) assert.ok(actions.includes(a), `activity has ${a}: ${actions}`);
 });
 
 test('accessory checkout and checkin by user', async () => {

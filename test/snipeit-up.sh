@@ -4,7 +4,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 docker compose up -d
-art() { docker compose exec -T app php artisan "$@"; }
+# run as the web user so Passport keys are readable by the app
+art() { docker compose exec -T -u docker app php artisan "$@"; }
 echo -n "waiting for app"
 for i in $(seq 1 150); do
   code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8765/ || true)
