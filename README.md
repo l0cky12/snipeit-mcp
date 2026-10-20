@@ -18,7 +18,7 @@ Environment variables override the file: `SNIPEIT_URL`, `SNIPEIT_API_TOKEN`, and
 
 `SNIPEIT_READ_ONLY` accepts `1`, `true`, or `yes` to enable read-only mode, and `0`, `false`, or `no` to disable it (case-insensitive). Invalid values or malformed config files stop startup. Running setup again preserves the saved read-only setting and replaces the credentials file with owner-only permissions.
 
-Use the final HTTP(S) instance URL without embedded credentials, query parameters, or a fragment. Requests time out after 30 seconds and reject redirects and non-JSON success responses. Writes are not automatically retried; if a request times out, check the record before retrying because Snipe-IT may have completed the write.
+Use the final HTTP(S) instance URL without embedded credentials, query parameters, or a fragment. Plain `http://` is only accepted for loopback and private-network hosts (`localhost`, `*.localhost`, `127.x`, `10.x`, `172.16-31.x`, `192.168.x`); anything else needs `https://` or `SNIPEIT_ALLOW_HTTP=1`, because the token would cross the network in cleartext. Requests time out after 30 seconds and reject redirects and non-JSON success responses. Writes are not automatically retried; if a request times out, check the record before retrying because Snipe-IT may have completed the write.
 
 ### Claude Code
 
@@ -63,6 +63,12 @@ Resources: `hardware`, `users`, `licenses`, `accessories`, `consumables`, `compo
 Responses are trimmed by default: nested date objects collapse to strings, nulls and `available_actions` are dropped, custom fields become `{name: value}`. Pass `raw: true` to `list`/`get` for the untouched payload.
 
 Pass `search`, `sort`, `order`, `limit`, and `offset` as top-level `list` arguments, not inside `filters`. Internal custom-field and assignment lookups follow pagination. Checkout rejects unsupported target types; license checkin requires exactly one of `from_user_id` or `from_asset_id`.
+
+## Security notes
+
+- **Snipe-IT content is untrusted input to the calling agent.** Asset names, notes, custom fields and error messages reach the model verbatim. Anyone who can edit a record can plant instructions there (stored prompt injection) that a privileged agent may then act on with its write tools. Review write actions, and use `SNIPEIT_READ_ONLY=1` for agents that only need to read.
+- **Use a least-privilege API token.** The server can do whatever the token owner can do in the web UI. Prefer a dedicated account with only the permissions the agent needs over a superuser token.
+- `create`/`update` refuse `permissions`, `groups`, `id` and timestamp fields, and string values over 64 KB. Grant group membership and permissions in the web UI.
 
 ## Development
 
