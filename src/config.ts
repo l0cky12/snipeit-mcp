@@ -1,8 +1,10 @@
+import { isIPv4 } from 'node:net';
 import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
-import { SnipeIT } from './snipeit.js';
+import { Writable } from 'node:stream';
+import { baseUrl, SnipeIT, type Row } from './snipeit.js';
 
 export interface Config {
     url: string;
@@ -35,6 +37,23 @@ function readConfig(): Partial<Config> {
     }
 }
 
+function isPrivateHost(host: string): boolean {
+    if (host === 'localhost' || host.endsWith('.localhost') || host === '[::1]') return true;
+    if (!isIPv4(host)) return false;
+    const [a, b] = host.split('.').map(Number);
+    return a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+}
+
+/** Validate the URL and refuse to send the token in cleartext beyond loopback/private LANs unless explicitly allowed. */
+function checkUrl(url: string): void {
+    const { protocol, hostname } = baseUrl(url);
+    if (protocol !== 'http:' || isPrivateHost(hostname)) return;
+    if (process.env.SNIPEIT_ALLOW_HTTP?.trim() !== '1') {
+        throw new Error(`Refusing to send the Snipe-IT API token over plain http:// to ${hostname}. Use https://, or set SNIPEIT_ALLOW_HTTP=1 to accept the risk.`);
+    }
+    console.error(`WARNING: SNIPEIT_ALLOW_HTTP=1: the Snipe-IT API token is sent unencrypted to ${hostname}; anyone on the network path can read and reuse it.`);
+}
+
 /** Env vars win; the file written by `snipeit-mcp setup` is the fallback. */
 export function loadConfig(): Config {
     const file = readConfig();
@@ -50,19 +69,32 @@ export function loadConfig(): Config {
         throw new Error('SNIPEIT_READ_ONLY must be 1/true/yes or 0/false/no');
     }
     const readOnly = ro !== undefined ? /^(1|true|yes)$/i.test(ro) : Boolean(file.readOnly);
+    checkUrl(url);
     return { url: url.replace(/\/+$/, ''), token, readOnly };
 }
 
 export async function setup(): Promise<void> {
     const previous = readConfig();
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    // In terminal mode readline does its own echo through `output`, so muting it hides the token.
+    let muted = false;
+    const output = new Writable({
+        write(chunk, _encoding, done) {
+            if (!muted) process.stdout.write(chunk);
+            done();
+        }
+    });
+    const rl = createInterface({ input: process.stdin, output, terminal: Boolean(process.stdin.isTTY) });
     try {
         const url = (await rl.question('Snipe-IT URL (e.g. https://snipeit.example.com): ')).trim().replace(/\/+$/, '');
-        const token = (await rl.question('Personal API token (Account > API Keys in Snipe-IT): ')).trim();
-        process.stdout.write('Validating... ');
-        const me = await new SnipeIT(url, token).get('users/me');
+        checkUrl(url);
+        process.stdout.write('Personal API token (Account > API Keys in Snipe-IT, input hidden): ');
+        muted = true;
+        const token = (await rl.question('')).trim();
+        muted = false;
+        process.stdout.write('\nValidating... ');
+        const me = (await new SnipeIT(url, token).get('users/me')) as Row;
         console.log(`ok, authenticated as ${me.username ?? me.name ?? 'unknown user'}`);
-        const perms = me.permissions ?? {};
+        const perms = (me.permissions ?? {}) as Row;
         if (String(perms.superuser) !== '1') {
             console.log(
                 'WARNING: this token is not from a superuser account. The MCP server can only do what the token owner can do in the web UI.'

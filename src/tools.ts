@@ -1,11 +1,19 @@
 import { McpServer } from '@modelcontextprotocol/server';
 import * as z from 'zod';
 import type { Config } from './config.js';
-import { RESOURCES, SnipeIT, trim, type Resource } from './snipeit.js';
+import { RESOURCES, SnipeIT, trim, type Resource, type Row } from './snipeit.js';
 
 const ALL = Object.keys(RESOURCES) as [Resource, ...Resource[]];
 const WRITABLE = ALL.filter(r => r !== 'activity') as [Resource, ...Resource[]];
 const CHECKOUTABLE = ['hardware', 'accessories', 'consumables', 'components', 'licenses'] as const;
+/** Privilege and bookkeeping keys the agent may not write: permissions/groups would let it mint admins. */
+const RESERVED = /^(permissions|groups|id|created_at|updated_at|deleted_at)(\[|\.|$)/i;
+const MAX_STRING_BYTES = 64 * 1024;
+/** Options each checkout/checkin handler actually sends; anything else is rejected instead of silently ignored. */
+const OPTIONS: Record<'checkout' | 'checkin', Record<(typeof CHECKOUTABLE)[number], string[]>> = {
+    checkout: { hardware: ['expected_checkin', 'status_id', 'name'], accessories: ['quantity'], consumables: ['quantity'], components: ['quantity'], licenses: [] },
+    checkin: { hardware: ['status_id', 'location_id'], accessories: ['from_user_id'], components: ['from_asset_id', 'quantity'], licenses: ['from_user_id', 'from_asset_id'], consumables: [] }
+};
 
 /** Field docs served by `describe`, kept out of tool descriptions so they only cost tokens when asked for. */
 const FIELDS: Record<Resource, string> = {
@@ -13,7 +21,7 @@ const FIELDS: Record<Resource, string> = {
         'create/update: asset_tag* (omit if auto-increment is on), model_id*, status_id*, name, serial, company_id, supplier_id, location_id, rtd_location_id (default location), purchase_date YYYY-MM-DD, purchase_cost, order_number, warranty_months, notes, requestable, archived, byod, last_audit_date, next_audit_date, assigned_user|assigned_asset|assigned_location (checkout on create). Custom fields may be passed by their display name.\n' +
         'list filters: status (RTD|Deployed|Undeployable|Deleted|Archived|Requestable), status_id, model_id, category_id, manufacturer_id, company_id, location_id, supplier_id, order_number, assigned_to + assigned_type (user|asset|location).',
     users:
-        'create: first_name*, username*, password*, password_confirmation*. create/update: last_name, email, employee_num, jobtitle, phone, manager_id, department_id, location_id, company_id, groups (id or [ids]), activated, remote, vip, notes, start_date, end_date, permissions (JSON string, e.g. {"superuser":"1"} or {"admin":"1"}).\n' +
+        'create: first_name*, username*, password*, password_confirmation*. create/update: last_name, email, employee_num, jobtitle, phone, manager_id, department_id, location_id, company_id, activated, remote, vip, notes, start_date, end_date. Groups and permissions cannot be set through this server.\n' +
         'list filters: username, email, employee_num, first_name, last_name, department_id, company_id, location_id, group_id, deleted (true = only deleted), all (true = deleted + active).',
     licenses:
         'create/update: name*, seats*, category_id*, company_id, manufacturer_id, supplier_id, serial (product key), license_name, license_email, order_number, purchase_order, purchase_cost, purchase_date, expiration_date, termination_date, maintained, reassignable, depreciation_id, notes.\n' +
@@ -34,7 +42,7 @@ const FIELDS: Record<Resource, string> = {
     status_labels: 'create/update: name*, type* (deployable|pending|undeployable|archived), color (#hex), show_in_nav, default_label, notes.',
     suppliers: 'create/update: name*, address, address2, city, state, country, zip, phone, fax, email, contact, url, notes.',
     departments: 'create/update: name*, company_id, manager_id, location_id, phone, fax, notes.',
-    groups: 'create/update: name*, permissions (JSON string of permission flags).',
+    groups: 'create/update: name*. Permissions cannot be set through this server.',
     fields:
         'create/update: name*, element* (text|textarea|listbox|checkbox|radio|email|url|numeric|date), format (ANY|ALPHA|NUMERIC|EMAIL|URL|IP|MAC|DATE|BOOLEAN|regex:...), field_values (newline-separated options), help_text, show_in_email, show_in_listview, is_unique, display_in_user_view, auto_add_to_fieldsets.',
     fieldsets: 'create/update: name*. Attach fields with update on the field (fieldset_id) or via the web UI.',
@@ -53,9 +61,27 @@ const run =
             const r = await fn(a);
             return typeof r === 'string' ? text(r) : json(r);
         } catch (e) {
-            return { ...text(e instanceof Error ? e.message : String(e)), isError: true };
+            // fetch() reports only "fetch failed"; the cause says ECONNREFUSED, ENOTFOUND, certificate errors etc.
+            const cause = (e as { cause?: { message?: string; code?: string } })?.cause;
+            const detail = cause?.message || cause?.code;
+            return { ...text((e instanceof Error ? e.message : String(e)) + (detail ? ` (${detail})` : '')), isError: true };
         }
     };
+
+function checkData(data: Row): void {
+    const reserved = Object.keys(data).filter(k => RESERVED.test(k));
+    if (reserved.length) throw new Error(`These fields cannot be written through this server: ${reserved.join(', ')}`);
+    const oversized = (v: unknown): boolean =>
+        typeof v === 'string' ? Buffer.byteLength(v) > MAX_STRING_BYTES : !!v && typeof v === 'object' && Object.values(v).some(oversized);
+    const big = Object.keys(data).filter(k => oversized(data[k]));
+    if (big.length) throw new Error(`Values longer than ${MAX_STRING_BYTES / 1024} KB are not accepted: ${big.join(', ')}`);
+}
+
+function checkOptions(tool: 'checkout' | 'checkin', args: { resource: (typeof CHECKOUTABLE)[number] }): void {
+    const allowed = ['resource', 'id', 'to', 'target_id', 'note', ...OPTIONS[tool][args.resource]];
+    const bad = Object.entries(args).filter(([k, v]) => v !== undefined && !allowed.includes(k)).map(([k]) => k);
+    if (bad.length) throw new Error(`${tool} ${args.resource} does not use: ${bad.join(', ')}`);
+}
 
 const id = z.number().int().positive();
 const ro = { readOnlyHint: true, destructiveHint: false };
@@ -102,8 +128,10 @@ export function buildServer(cfg: Config): McpServer {
             }
             const data = await api.get(path, { search, sort, order, limit, offset, ...filters });
             if (raw) return data;
-            const rows = data.rows ?? data.assets ?? data.accessories ?? data.licenses ?? data;
-            return { total: data.total ?? rows.length, offset, rows: trim(rows) };
+            const env = data as Row;
+            const rows = [env.rows, env.assets, env.accessories, env.licenses].find(Array.isArray);
+            if (!rows) throw new Error(`Snipe-IT returned no rows for ${path}`);
+            return { total: data.total ?? offset + rows.length, offset, rows: trim(rows) };
         })
     );
 
@@ -165,6 +193,11 @@ export function buildServer(cfg: Config): McpServer {
     if (cfg.readOnly) return server;
 
     const data = z.record(z.string(), z.unknown()).describe('Field values; see describe');
+    /** Single funnel for create/update payloads. */
+    const body = async (resource: Resource, data: Row) => {
+        checkData(data);
+        return resource === 'hardware' ? await api.mapCustomFields(data) : data;
+    };
 
     server.registerTool(
         'create',
@@ -175,7 +208,7 @@ export function buildServer(cfg: Config): McpServer {
             annotations: rw
         },
         run(async ({ resource, data }) =>
-            trim(await api.post(RESOURCES[resource], resource === 'hardware' ? await api.mapCustomFields(data) : data))
+            trim(await api.post(RESOURCES[resource], await body(resource, data)))
         )
     );
 
@@ -188,7 +221,7 @@ export function buildServer(cfg: Config): McpServer {
             annotations: { ...rw, idempotentHint: true }
         },
         run(async ({ resource, id, data }) =>
-            trim(await api.patch(`${RESOURCES[resource]}/${id}`, resource === 'hardware' ? await api.mapCustomFields(data) : data))
+            trim(await api.patch(`${RESOURCES[resource]}/${id}`, await body(resource, data)))
         )
     );
 
@@ -233,7 +266,9 @@ export function buildServer(cfg: Config): McpServer {
             }),
             annotations: rw
         },
-        run(async ({ resource, id, to, target_id, quantity, note, expected_checkin, status_id, name }) => {
+        run(async args => {
+            checkOptions('checkout', args);
+            const { resource, id, to, target_id, quantity, note, expected_checkin, status_id, name } = args;
             switch (resource) {
                 case 'hardware':
                     return trim(
@@ -285,7 +320,9 @@ export function buildServer(cfg: Config): McpServer {
             }),
             annotations: rw
         },
-        run(async ({ resource, id, from_user_id, from_asset_id, quantity, note, status_id, location_id }) => {
+        run(async args => {
+            checkOptions('checkin', args);
+            const { resource, id, from_user_id, from_asset_id, quantity, note, status_id, location_id } = args;
             switch (resource) {
                 case 'hardware':
                     return trim(await api.post(`hardware/${id}/checkin`, { note, status_id, location_id }));
@@ -293,14 +330,17 @@ export function buildServer(cfg: Config): McpServer {
                     if (!from_user_id) throw new Error('accessories checkin needs from_user_id');
                     // rows: { id: <checkout record id>, assigned_to: {id, ...} }
                     const row = await api.findRow(`accessories/${id}/checkedout`,
-                        r => r.assigned_to?.id === from_user_id && (!r.assigned_to.type || r.assigned_to.type === 'user'));
+                        r => {
+                            const to = r.assigned_to as Row | undefined;
+                            return to?.id === from_user_id && (!to.type || to.type === 'user');
+                        });
                     if (!row) throw new Error(`Accessory ${id} is not checked out to user ${from_user_id}`);
                     return trim(await api.post(`accessories/${row.id}/checkin`, { note }));
                 }
                 case 'components': {
                     if (!from_asset_id) throw new Error('components checkin needs from_asset_id');
                     // rows: { assigned_pivot_id, name: <compact asset>, assigned_qty }
-                    const row = await api.findRow(`components/${id}/assets`, r => (r.name?.id ?? r.id) === from_asset_id);
+                    const row = await api.findRow(`components/${id}/assets`, r => ((r.name as Row | undefined)?.id ?? r.id) === from_asset_id);
                     if (!row) throw new Error(`Component ${id} is not checked out to asset ${from_asset_id}`);
                     return trim(
                         await api.post(`components/${row.assigned_pivot_id}/checkin`, {
@@ -312,7 +352,7 @@ export function buildServer(cfg: Config): McpServer {
                 case 'licenses': {
                     if (Boolean(from_user_id) === Boolean(from_asset_id)) throw new Error('licenses checkin needs exactly one of from_user_id or from_asset_id');
                     const seat = await api.findRow(`licenses/${id}/seats`,
-                        s => from_user_id !== undefined ? s.assigned_user?.id === from_user_id : s.assigned_asset?.id === from_asset_id
+                        s => (s[from_user_id !== undefined ? 'assigned_user' : 'assigned_asset'] as Row | undefined)?.id === (from_user_id ?? from_asset_id)
                     );
                     if (!seat) throw new Error(`License ${id} has no seat assigned to that user/asset`);
                     return trim(await api.put(`licenses/${id}/seats/${seat.id}`, { assigned_to: null, asset_id: null, note }));
