@@ -82,7 +82,9 @@ export function buildServer(cfg: Config): McpServer {
                 resource: z.enum(ALL),
                 search: z.string().optional().describe('Free-text search'),
                 user_id: id.optional().describe('Only items checked out to this user (hardware, accessories, licenses)'),
-                filters: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
+                filters: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()]))
+                    .refine(filters => !['search', 'sort', 'order', 'limit', 'offset'].some(key => key in filters),
+                        'Use top-level search, sort, order, limit and offset instead of filters').optional(),
                 sort: z.string().optional(),
                 order: z.enum(['asc', 'desc']).optional(),
                 limit: z.number().int().min(1).max(500).default(25),
@@ -245,16 +247,18 @@ export function buildServer(cfg: Config): McpServer {
                         })
                     );
                 case 'accessories':
+                    if (to !== 'user') throw new Error('accessories can only be checked out to a user');
                     return trim(await api.post(`accessories/${id}/checkout`, { assigned_user: target_id, checkout_qty: quantity ?? 1, note }));
                 case 'consumables':
+                    if (to !== 'user') throw new Error('consumables can only be checked out to a user');
                     return trim(await api.post(`consumables/${id}/checkout`, { assigned_to: target_id, checkout_qty: quantity ?? 1, note }));
                 case 'components':
                     if (to !== 'asset') throw new Error('components can only be checked out to an asset (to: "asset")');
                     return trim(await api.post(`components/${id}/checkout`, { assigned_to: target_id, assigned_qty: quantity ?? 1, note }));
                 case 'licenses': {
-                    const seats = (await api.get(`licenses/${id}/seats`, { limit: 500 })).rows ?? [];
+                    if (to === 'location') throw new Error('licenses can only be checked out to a user or asset');
                     // disabled = seat already used on a non-reassignable license, or the license is inactive
-                    const free = seats.find((s: any) => !s.assigned_user && !s.assigned_asset && !s.disabled);
+                    const free = await api.findRow(`licenses/${id}/seats`, s => !s.assigned_user && !s.assigned_asset && !s.disabled);
                     if (!free) throw new Error(`License ${id} has no free seats available for checkout`);
                     const body = to === 'asset' ? { asset_id: target_id, note } : { assigned_to: target_id, note };
                     return trim(await api.put(`licenses/${id}/seats/${free.id}`, body));
@@ -288,16 +292,15 @@ export function buildServer(cfg: Config): McpServer {
                 case 'accessories': {
                     if (!from_user_id) throw new Error('accessories checkin needs from_user_id');
                     // rows: { id: <checkout record id>, assigned_to: {id, ...} }
-                    const rows = (await api.get(`accessories/${id}/checkedout`, { limit: 500 })).rows ?? [];
-                    const row = rows.find((r: any) => r.assigned_to?.id === from_user_id);
+                    const row = await api.findRow(`accessories/${id}/checkedout`,
+                        r => r.assigned_to?.id === from_user_id && (!r.assigned_to.type || r.assigned_to.type === 'user'));
                     if (!row) throw new Error(`Accessory ${id} is not checked out to user ${from_user_id}`);
                     return trim(await api.post(`accessories/${row.id}/checkin`, { note }));
                 }
                 case 'components': {
                     if (!from_asset_id) throw new Error('components checkin needs from_asset_id');
-                    const rows = (await api.get(`components/${id}/assets`, { limit: 500 })).rows ?? [];
                     // rows: { assigned_pivot_id, name: <compact asset>, assigned_qty }
-                    const row = rows.find((r: any) => (r.name?.id ?? r.id) === from_asset_id);
+                    const row = await api.findRow(`components/${id}/assets`, r => (r.name?.id ?? r.id) === from_asset_id);
                     if (!row) throw new Error(`Component ${id} is not checked out to asset ${from_asset_id}`);
                     return trim(
                         await api.post(`components/${row.assigned_pivot_id}/checkin`, {
@@ -307,10 +310,9 @@ export function buildServer(cfg: Config): McpServer {
                     );
                 }
                 case 'licenses': {
-                    if (!from_user_id && !from_asset_id) throw new Error('licenses checkin needs from_user_id or from_asset_id');
-                    const seats = (await api.get(`licenses/${id}/seats`, { limit: 500 })).rows ?? [];
-                    const seat = seats.find(
-                        (s: any) => (from_user_id && s.assigned_user?.id === from_user_id) || (from_asset_id && s.assigned_asset?.id === from_asset_id)
+                    if (Boolean(from_user_id) === Boolean(from_asset_id)) throw new Error('licenses checkin needs exactly one of from_user_id or from_asset_id');
+                    const seat = await api.findRow(`licenses/${id}/seats`,
+                        s => from_user_id !== undefined ? s.assigned_user?.id === from_user_id : s.assigned_asset?.id === from_asset_id
                     );
                     if (!seat) throw new Error(`License ${id} has no seat assigned to that user/asset`);
                     return trim(await api.put(`licenses/${id}/seats/${seat.id}`, { assigned_to: null, asset_id: null, note }));

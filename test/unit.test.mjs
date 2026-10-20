@@ -2,6 +2,89 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { SnipeIT, trim } from '../dist/snipeit.js';
 import { startServer } from './rpc.mjs';
+import { createServer } from 'node:http';
+
+test('redirects are not followed and a stalled response body times out', async t => {
+    let requests = 0;
+    const server = createServer((req, res) => {
+        requests++;
+        if (req.url.endsWith('/redirect')) {
+            res.writeHead(302, { Location: '/api/v1/destination' });
+            res.end();
+        } else {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.write('{');
+        }
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    t.after(() => { server.closeAllConnections(); server.close(); });
+    const api = new SnipeIT(`http://127.0.0.1:${server.address().port}`, 't');
+    await assert.rejects(api.get('redirect'), /fetch failed/);
+    assert.equal(requests, 1);
+    const timeout = AbortSignal.timeout;
+    t.mock.method(AbortSignal, 'timeout', ms => {
+        assert.equal(ms, 30_000);
+        return timeout(50);
+    });
+    await assert.rejects(api.get('stall'), /abort|timeout/i);
+});
+
+test('pagination stops at exhaustion or an empty page and rejects malformed totals', async t => {
+    const api = new SnipeIT('http://x', 't');
+    let calls = 0;
+    t.mock.method(globalThis, 'fetch', async () => {
+        calls++;
+        return Response.json({ total: 1, rows: [{ id: 1 }] });
+    });
+    assert.equal(await api.findRow('hardware', () => false), undefined);
+    assert.equal(calls, 1);
+    t.mock.method(globalThis, 'fetch', async () => Response.json({ total: 9, rows: [] }));
+    assert.equal(await api.findRow('hardware', () => false), undefined);
+    t.mock.method(globalThis, 'fetch', async () => Response.json({ total: 'invalid', rows: [{ id: 1 }] }));
+    await assert.rejects(api.findRow('hardware', () => false), /invalid total/);
+});
+
+test('HTTP client rejects redirects and non-JSON success, and bounds requests', async t => {
+    const api = new SnipeIT('http://x', 't');
+    let options;
+    t.mock.method(globalThis, 'fetch', async (_url, init) => {
+        options = init;
+        return new Response('<html>Login</html>');
+    });
+    await assert.rejects(api.post('hardware', {}), /JSON/);
+    assert.equal(options.redirect, 'error');
+    assert.ok(options.signal instanceof AbortSignal);
+});
+
+test('HTTP null error bodies keep the status instead of throwing a TypeError', async t => {
+    t.mock.method(globalThis, 'fetch', async () => new Response('null', { status: 502 }));
+    await assert.rejects(new SnipeIT('http://x', 't').get('hardware'), /HTTP 502/);
+});
+
+test('invalid base URLs fail before sending credentials', () => {
+    for (const url of ['ftp://x', 'http://user:password@x', 'https://x?proxy=1', 'https://x#fragment']) {
+        assert.throws(() => new SnipeIT(url, 'secret'), /URL/);
+    }
+});
+
+test('custom field metadata retries failed requests and includes later pages', async t => {
+    const api = new SnipeIT('http://x', 't');
+    let calls = 0;
+    t.mock.method(globalThis, 'fetch', async url => {
+        if (++calls === 1) return new Response('{}', { status: 503 });
+        const offset = Number(url.searchParams.get('offset'));
+        return Response.json({ total: 2, rows: [{ name: offset ? 'Second' : 'First', db_column_name: `_snipeit_${offset}` }] });
+    });
+    await assert.rejects(api.customFields(), /503/);
+    assert.deepEqual(await api.mapCustomFields({ Second: 'value' }), { _snipeit_1: 'value' });
+    assert.equal(calls, 3);
+});
+
+test('trim only collapses date wrappers and preserves special JSON keys', () => {
+    assert.deepEqual(trim({ formatted: 'display', value: 3 }), { formatted: 'display', value: 3 });
+    const input = JSON.parse('{"__proto__":{"safe":true},"custom_fields":{"__proto__":{"value":"custom"}}}');
+    assert.equal(JSON.stringify(trim(input)), '{"__proto__":{"safe":true},"custom_fields":{"__proto__":"custom"}}');
+});
 
 test('trim collapses Snipe-IT wrappers', () => {
     const raw = {

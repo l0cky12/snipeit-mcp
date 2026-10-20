@@ -8,25 +8,25 @@ export function trim(v: unknown): unknown {
     if (!v || typeof v !== 'object') return v;
     const o = v as Record<string, unknown>;
     const keys = Object.keys(o);
-    if (keys.length === 2 && 'formatted' in o) return o.datetime ?? o.date ?? o.formatted;
-    const out: Record<string, unknown> = {};
+    if (keys.length === 2 && 'formatted' in o && ('datetime' in o || 'date' in o)) return o.datetime ?? o.date ?? o.formatted;
+    const out: [string, unknown][] = [];
     for (const [k, val] of Object.entries(o)) {
         if (DROP.has(k) || val === null || val === '') continue;
         if (k === 'custom_fields' && val && typeof val === 'object' && !Array.isArray(val)) {
-            const cf: Record<string, unknown> = {};
+            const cf: [string, unknown][] = [];
             for (const [name, f] of Object.entries(val as Record<string, { value?: unknown }>)) {
-                if (f?.value !== null && f?.value !== undefined && f?.value !== '') cf[name] = f.value;
+                if (f?.value !== null && f?.value !== undefined && f?.value !== '') cf.push([name, f.value]);
             }
-            if (Object.keys(cf).length) out.custom_fields = cf;
+            if (cf.length) out.push(['custom_fields', Object.fromEntries(cf)]);
             continue;
         }
         const t = trim(val);
         if (t === undefined) continue;
         if (Array.isArray(t) && t.length === 0) continue;
         if (t && typeof t === 'object' && !Array.isArray(t) && Object.keys(t).length === 0) continue;
-        out[k] = t;
+        out.push([k, t]);
     }
-    return out;
+    return Object.fromEntries(out);
 }
 
 export class SnipeIT {
@@ -35,7 +35,14 @@ export class SnipeIT {
     constructor(
         private readonly url: string,
         private readonly token: string
-    ) {}
+    ) {
+        const base = new URL(url);
+        if (!['http:', 'https:'].includes(base.protocol) || base.username || base.password || base.search || base.hash) {
+            throw new Error('Snipe-IT URL must use HTTP(S) without credentials, a query or a fragment');
+        }
+        this.url = base.href.replace(/\/+$/, '');
+        if (!token.trim()) throw new Error('Snipe-IT API token must not be empty');
+    }
 
     async request(method: string, path: string, query?: Record<string, unknown>, body?: unknown): Promise<any> {
         const u = new URL(`${this.url}/api/v1/${path.replace(/^\/+/, '')}`);
@@ -44,6 +51,8 @@ export class SnipeIT {
         }
         const res = await fetch(u, {
             method,
+            redirect: 'error',
+            signal: AbortSignal.timeout(30_000),
             headers: {
                 Authorization: `Bearer ${this.token}`,
                 Accept: 'application/json',
@@ -56,10 +65,10 @@ export class SnipeIT {
         try {
             data = JSON.parse(text);
         } catch {
-            /* non-JSON body */
+            if (res.ok) throw new Error(`Snipe-IT returned non-JSON data on ${method} ${u.pathname}`);
         }
         if (!res.ok) {
-            const msg = typeof data === 'string' ? data.slice(0, 300) : JSON.stringify(data.messages ?? data.message ?? data);
+            const msg = typeof data === 'string' ? data.slice(0, 300) : JSON.stringify(data?.messages ?? data?.message ?? data);
             throw new Error(`Snipe-IT HTTP ${res.status} on ${method} ${u.pathname}: ${msg}`);
         }
         // Snipe-IT reports validation failures as HTTP 200 with status: "error".
@@ -85,12 +94,33 @@ export class SnipeIT {
         return this.request('DELETE', path);
     }
 
+    /** Follow the server's total, since its page cap can be lower than our requested limit. */
+    async *rows(path: string): AsyncGenerator<any> {
+        let offset = 0;
+        while (true) {
+            const data = await this.get(path, { limit: 500, offset });
+            if (!Array.isArray(data?.rows)) throw new Error(`Snipe-IT returned no rows for ${path}`);
+            const total = Number(data.total ?? offset + data.rows.length);
+            if (!Number.isSafeInteger(total) || total < 0) throw new Error(`Snipe-IT returned an invalid total for ${path}`);
+            yield* data.rows;
+            offset += data.rows.length;
+            if (!data.rows.length || offset >= total) return;
+        }
+    }
+
+    async findRow(path: string, matches: (row: any) => boolean): Promise<any> {
+        for await (const row of this.rows(path)) if (matches(row)) return row;
+    }
+
     /** Lower-cased custom field name -> db column (e.g. "mac address" -> "_snipeit_mac_address_5"). Cached per process. */
     customFields(): Promise<Map<string, string>> {
-        this.fields ??= this.get('fields', { limit: 500 }).then((r: any) => {
+        this.fields ??= (async () => {
             const m = new Map<string, string>();
-            for (const f of r.rows ?? []) m.set(String(f.name).toLowerCase(), f.db_column_name);
+            for await (const f of this.rows('fields')) m.set(String(f.name).toLowerCase(), f.db_column_name);
             return m;
+        })().catch(error => {
+            this.fields = undefined;
+            throw error;
         });
         return this.fields;
     }
@@ -98,9 +128,7 @@ export class SnipeIT {
     /** Rename friendly custom-field keys to their db column names; raw _snipeit_ keys pass through. */
     async mapCustomFields(data: Record<string, unknown>): Promise<Record<string, unknown>> {
         const map = await this.customFields();
-        const out: Record<string, unknown> = {};
-        for (const [k, v] of Object.entries(data)) out[map.get(k.toLowerCase()) ?? k] = v;
-        return out;
+        return Object.fromEntries(Object.entries(data).map(([k, v]) => [map.get(k.toLowerCase()) ?? k, v]));
     }
 }
 
